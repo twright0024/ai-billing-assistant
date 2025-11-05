@@ -1,11 +1,7 @@
 import pandas as pd
 import pdfplumber
 import pytesseract
-from PIL import Image
 import re
-
-# Configure Tesseract path if needed (Windows example)
-# pytesseract.pytesseract.tesseract_cmd = r"C:\\Program Files\\Tesseract-OCR\\tesseract.exe"
 
 def load_invoice_dfs(uploaded_file):
     if uploaded_file.name.endswith(".csv"):
@@ -62,7 +58,4 @@ def parse_pdf(uploaded_file):
             "billed_amount": float(amount.replace(",", ""))
         })
 
-    line_items_df = pd.DataFrame(line_items)
-    accessorials_df = pd.DataFrame(accessorials)
-
-    return line_items_df, accessorials_df, total_amount_due
+    return pd.DataFrame(line_items), pd.DataFrame(accessorials), total_amount_due
