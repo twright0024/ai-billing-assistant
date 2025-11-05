@@ -1,0 +1,2 @@
+{"run_id": "8e02fb96f0f94ebe95fb2996704cf85e", "ts": "2025-11-04T03:19:15.416055", "totals": {"billed_total": 13911.29, "expected_total": 13215.7255, "variance_total": 695.5645000000004}, "counts": {"lines": 17}}
+{"run_id": "5179839df4d34bff8dd18448bbc97844", "ts": "2025-11-04T15:55:35.104968", "totals": {"billed_total": 16870.76, "expected_total": 16027.222000000002, "variance_total": 843.5379999999968}, "counts": {"lines": 12}}
