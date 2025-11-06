@@ -1,1 +1,2 @@
 tesseract-ocr
+pip install --upgrade pip setuptools wheel
