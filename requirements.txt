@@ -8,4 +8,6 @@ streamlit==1.39.0
 pandas==2.2.2
 pdfplumber==0.11.0
 pytesseract==0.3.10
-pillow==11.0.0
+pillow==10.4.0
+
+# Do NOT pin Pillow 11; let Streamlit resolve a <11 version (e.g., 10.4.0)
