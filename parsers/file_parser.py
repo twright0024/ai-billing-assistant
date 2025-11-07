@@ -2,8 +2,121 @@ import pandas as pd
 import pdfplumber
 import pytesseract
 import re
+from dataclasses import dataclass
+
+# ============ CHARGE CLASSIFICATION LOGIC ============
+
+BASE = "base_freight"
+FUEL = "fuel_surcharge"
+ACC  = "accessorial"
+ADJ  = "adjustment"
+TAX  = "tax_fee"
+OTHER= "other"
+
+SUMMARY_PAT = re.compile(r"(sub\s*total|subtotal|total|amount\s*due|invoice\s*amount|balance|remittance|please\s*pay)", re.I)
+FUEL_PAT    = re.compile(r"\b(fuel\s*surch(?:arge)?|fsc|fuel\s*surch\.)\b", re.I)
+BASE_PAT    = re.compile(r"\b(base|freight\s*charge|linehaul|line\s*haul|lh|store\s*fix(?:ture)?s?)\b", re.I)
+TAX_PAT     = re.compile(r"\b(tax|sales\s*tax)\b", re.I)
+ADJ_PAT     = re.compile(r"\b(discount|credit|adj(?:ustment)?|rebate)\b", re.I)
+EXTRA_INFO  = re.compile(r"\b(FAK|EZONE|PZONE|tariff|original\s+(revenue|weight)|dimension|density|pcf|inspecting\s+terminal|inspection)\b", re.I)
+
+ACCESSORIAL_MAP = [
+    (re.compile(r"\bresidential(\s+delivery)?\b", re.I),  "residential_delivery"),
+    (re.compile(r"\blift[\s\-]?gate\b", re.I),            "liftgate"),
+    (re.compile(r"\blimited\s*access\b", re.I),           "limited_access"),
+    (re.compile(r"\bappointment|appt\b", re.I),           "appointment"),
+    (re.compile(r"\binside\s*delivery\b", re.I),          "inside_delivery"),
+    (re.compile(r"\bredeliver(y)?(\s*charge|\s*chg)?\b", re.I), "redelivery"),
+    (re.compile(r"\breweigh\b", re.I),                    "reweigh"),
+    (re.compile(r"\breclass\b", re.I),                    "reclass"),
+    (re.compile(r"\boverlength|extreme\s*length|>\s*96", re.I), "overlength"),
+    (re.compile(r"\bhazmat|hazardous\b", re.I),           "hazmat"),
+    (re.compile(r"\bdetention\b", re.I),                  "detention"),
+    (re.compile(r"\bstorage\b", re.I),                    "storage"),
+    (re.compile(r"\bcorrection\s*fee\b", re.I),           "correction_fee"),
+    (re.compile(r"\bweight\s*validation\s*fee\b", re.I),  "weight_validation"),
+]
+
+@dataclass
+class ChargeRow:
+    desc: str
+    amount: float
+    norm_type: str = ""
+    norm_subtype: str = ""
+    include: bool = True
+    reason: str = ""
+
+def _normalize_row(row: ChargeRow) -> ChargeRow:
+    d = (row.desc or "").strip()
+    if SUMMARY_PAT.search(d):
+        row.include = False; row.reason = "summary_line"; row.norm_type = OTHER; return row
+    if EXTRA_INFO.search(d):
+        row.include = False; row.reason = "info_note"; row.norm_type = OTHER; return row
+    if FUEL_PAT.search(d):
+        row.norm_type, row.norm_subtype = FUEL, "fuel"; return row
+    if TAX_PAT.search(d):
+        row.norm_type, row.norm_subtype = TAX, "tax"; return row
+    if ADJ_PAT.search(d) or (row.amount < 0):
+        row.norm_type, row.norm_subtype = ADJ, "credit_or_discount"; return row
+    if BASE_PAT.search(d):
+        row.norm_type, row.norm_subtype = BASE, "base"; return row
+    for pat, sub in ACCESSORIAL_MAP:
+        if pat.search(d):
+            row.norm_type, row.norm_subtype = ACC, sub; return row
+    row.norm_type = OTHER; return row
+
+def _apply_rules(rows: list[ChargeRow]) -> list[ChargeRow]:
+    rows = [_normalize_row(r) for r in rows]
+    seen = set()
+    for r in rows:
+        if not r.include: continue
+        if r.norm_type in (FUEL, ACC):
+            key = (r.norm_type, r.norm_subtype, round(r.amount, 2))
+            if key in seen:
+                r.include = False; r.reason = "possible_duplicate"
+            else:
+                seen.add(key)
+    for r in rows:
+        if r.include and abs(r.amount) < 1e-8:
+            r.include = False
+            r.reason = "waived_accessorial" if r.norm_type == ACC else "zero_amount_excluded"
+    base_idxs = [i for i, r in enumerate(rows) if r.include and r.norm_type == BASE]
+    if len(base_idxs) > 1:
+        largest_i = max(base_idxs, key=lambda i: (rows[i].amount))
+        for i in base_idxs:
+            if i != largest_i:
+                rows[i].include = False; rows[i].reason = "duplicate_base"
+    return rows
+
+def validate_and_split(df_lines: pd.DataFrame):
+    df = df_lines.copy()
+    if "description" not in df.columns:
+        raise ValueError("Expected 'description' column")
+    if "amount" not in df.columns:
+        df["amount"] = 0.0
+
+    rows = [ChargeRow(str(d), float(a)) for d, a in zip(df["description"], df["amount"])]
+    rows = _apply_rules(rows)
+    out = pd.DataFrame([r.__dict__ for r in rows])
+
+    base_fuel = out[(out["include"]) & (out["norm_type"].isin([BASE, FUEL]))]
+    accessorials = out[(out["include"]) & (out["norm_type"] == ACC)]
+    adjustments = out[(out["include"]) & (out["norm_type"] == ADJ)]
+    excluded = out[~out["include"]]
+
+    totals = {
+        "base": round(base_fuel.loc[base_fuel["norm_type"] == BASE, "amount"].sum(), 2),
+        "fuel": round(base_fuel.loc[base_fuel["norm_type"] == FUEL, "amount"].sum(), 2),
+        "accessorials": round(accessorials["amount"].sum(), 2),
+        "adjustments": round(adjustments["amount"].sum(), 2)
+    }
+    totals["grand_included"] = round(sum(totals.values()), 2)
+    return base_fuel, accessorials, adjustments, excluded, totals
+
+# ============ MAIN LOADER ============
 
 def load_invoice_dfs(uploaded_file):
+    """Load any supported file and parse into structured DataFrames."""
     if uploaded_file.name.endswith(".csv"):
         df = pd.read_csv(uploaded_file)
         return df, pd.DataFrame(), None
@@ -26,36 +139,24 @@ def parse_pdf(uploaded_file):
                 img = page.to_image(resolution=300).original
                 text += pytesseract.image_to_string(img) + "\n"
 
-    # Regex patterns
-    freight_bill_pattern = re.compile(r"Freight\s*Bill\s*(?:No\.?|Number)\s*(\d+)", re.IGNORECASE)
-    total_due_pattern = re.compile(r"Total\s*Amount\s*Due\s*([\d,]+\.\d{2})", re.IGNORECASE)
-    line_item_pattern = re.compile(r"([A-Za-z0-9\-\/&\s]+)\s+([\d,]+\.\d{2})")
-    accessorial_pattern = re.compile(r"(Fuel Surcharge|FUEL SURCHG|Liftgate|REDELIVERY CHARGE|CORRECTION FEE)\s+([\d,]+\.\d{2})", re.IGNORECASE)
+    # regex: capture charge-like lines
+    line_pattern = re.compile(r"([A-Za-z0-9\-\/&\s]+?)\s+([\d,]+\.\d{2})")
+    matches = line_pattern.findall(text)
 
-    # Extract Freight Bill Number
-    freight_bill_match = freight_bill_pattern.search(text)
-    freight_bill_number = freight_bill_match.group(1) if freight_bill_match else "Unknown"
+    data = []
+    for desc, amount in matches:
+        data.append({"description": desc.strip(), "amount": float(amount.replace(",", ""))})
+    if not data:
+        return pd.DataFrame(), pd.DataFrame(), 0.0
 
-    # Extract Total Amount Due
-    total_due_match = total_due_pattern.search(text)
-    total_amount_due = float(total_due_match.group(1).replace(",", "")) if total_due_match else 0.0
+    df_lines = pd.DataFrame(data)
+    base_fuel, accessorials, adjustments, excluded, totals = validate_and_split(df_lines)
 
-    # Extract line items
-    line_items = []
-    for desc, amount in line_item_pattern.findall(text):
-        line_items.append({
-            "freight_bill_number": freight_bill_number,
-            "type": desc.strip(),
-            "billed_amount": float(amount.replace(",", ""))
-        })
-
-    # Extract accessorials
-    accessorials = []
-    for desc, amount in accessorial_pattern.findall(text):
-        accessorials.append({
-            "freight_bill_number": freight_bill_number,
-            "type": desc.strip(),
-            "billed_amount": float(amount.replace(",", ""))
-        })
-
-    return pd.DataFrame(line_items), pd.DataFrame(accessorials), total_amount_due
+    # Return full structured set
+    return {
+        "base_fuel": base_fuel,
+        "accessorials": accessorials,
+        "adjustments": adjustments,
+        "excluded": excluded,
+        "totals": totals
+    }
